@@ -114,10 +114,12 @@ def completion(
     litellm_params=None,
     logger_fn=None,
     headers={},
+    continue_message=None
 ):
     headers = validate_environment(api_key, headers)
     _is_function_call = False
     messages = copy.deepcopy(messages)
+    original_optional_params = copy.deepcopy(optional_params)
     optional_params = copy.deepcopy(optional_params)
     if model in custom_prompt_dict:
         # check if the model has a registered custom prompt
@@ -163,6 +165,12 @@ def completion(
         optional_params.pop("tools")
 
     stream = optional_params.pop("stream", None)
+
+    if continue_message:
+        messages.append({
+            "role": "assistant",
+            "content": continue_message
+        })
 
     data = {
         "model": model,
@@ -232,25 +240,47 @@ def completion(
                 message="No content in response",
                 status_code=response.status_code,
             )
+        elif completion_response.get("stop_reason", "") == "max_tokens":
+            print_verbose("detected max_tokens, recursing")
+            c_message = completion_response["content"][0].get("text", "").rstrip()
+            if continue_message is not None:
+                c_message = continue_message + c_message
+            return completion(
+                model,
+                messages,
+                api_base,
+                custom_prompt_dict,
+                model_response,
+                print_verbose,
+                encoding,
+                api_key,
+                logging_obj,
+                original_optional_params,
+                litellm_params,
+                logger_fn,
+                headers,
+                c_message
+            )
         else:
             text_content = completion_response["content"][0].get("text", None)
+            if continue_message is not None:
+                print_verbose("prepending continue message")
+                text_content = continue_message+text_content
             ## TOOL CALLING - OUTPUT PARSE
             if text_content is not None and "invoke" in text_content:
-                function_name = extract_between_tags("tool_name", text_content)[0]
-                function_arguments_str = extract_between_tags("invoke", text_content)[
+                function_call_content = extract_between_tags("invoke", text_content)[
                     0
                 ].strip()
-                function_arguments_str = f"<invoke>{function_arguments_str}</invoke>"
-                function_arguments = parse_xml_params(function_arguments_str)
+                if function_call_content.endswith("}\""):
+                    function_call_content = function_call_content[:-1]
+                parsed_function = json.loads(function_call_content)
+                parsed_function["arguments"] = json.dumps(parsed_function["arguments"])
                 _message = litellm.Message(
                     tool_calls=[
                         {
                             "id": f"call_{uuid.uuid4()}",
                             "type": "function",
-                            "function": {
-                                "name": function_name,
-                                "arguments": json.dumps(function_arguments),
-                            },
+                            "function": parsed_function,
                         }
                     ],
                     content=None,
