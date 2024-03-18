@@ -169,7 +169,7 @@ def completion(
     if continue_message:
         messages.append({
             "role": "assistant",
-            "content": continue_message
+            "content": continue_message[0]
         })
 
     data = {
@@ -242,9 +242,13 @@ def completion(
             )
         elif completion_response.get("stop_reason", "") == "max_tokens":
             print_verbose("detected max_tokens, recursing")
-            c_message = completion_response["content"][0].get("text", "").rstrip()
+            c_message = (completion_response["content"][0].get("text", "").rstrip(), completion_response["usage"])
             if continue_message is not None:
-                c_message = continue_message + c_message
+                c_message_content = continue_message[0] + c_message[0]
+                c_message_usage = completion_response["usage"]
+                c_message_usage["input_tokens"] += continue_message[1]["input_tokens"]
+                c_message_usage["output_tokens"] += continue_message[1]["output_tokens"]
+                c_message = (c_message_content, c_message_usage)
             return completion(
                 model,
                 messages,
@@ -265,7 +269,9 @@ def completion(
             text_content = completion_response["content"][0].get("text", None)
             if continue_message is not None:
                 print_verbose("prepending continue message")
-                text_content = continue_message+text_content
+                text_content = continue_message[0] + text_content
+                completion_response["usage"]["input_tokens"] += continue_message[1]["input_tokens"]
+                completion_response["usage"]["output_tokens"] += continue_message[1]["output_tokens"]
             ## TOOL CALLING - OUTPUT PARSE
             if text_content is not None and "invoke" in text_content:
                 function_call_content = extract_between_tags("invoke", text_content)[
