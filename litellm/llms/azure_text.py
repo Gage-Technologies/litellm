@@ -1,25 +1,29 @@
-from typing import Optional, Union, Any
-import types, requests
-from .base import BaseLLM
-from litellm.utils import (
-    ModelResponse,
-    Choices,
-    Message,
-    CustomStreamWrapper,
-    convert_to_model_response_object,
-    TranscriptionResponse,
-)
-from typing import Callable, Optional, BinaryIO
-from litellm import OpenAIConfig
-import litellm, json
-import httpx
-from .custom_httpx.azure_dall_e_2 import CustomHTTPTransport, AsyncCustomHTTPTransport
-from openai import AzureOpenAI, AsyncAzureOpenAI
-from ..llms.openai import OpenAITextCompletion
+import json
+import types  # type: ignore
 import uuid
-from .prompt_templates.factory import prompt_factory, custom_prompt
+from typing import Any, BinaryIO, Callable, Optional, Union
 
-openai_text_completion = OpenAITextCompletion()
+import httpx
+import requests
+from openai import AsyncAzureOpenAI, AzureOpenAI
+
+import litellm
+from litellm import OpenAIConfig
+from litellm.utils import (
+    Choices,
+    CustomStreamWrapper,
+    Message,
+    ModelResponse,
+    TextCompletionResponse,
+    TranscriptionResponse,
+    convert_to_model_response_object,
+)
+
+from ..llms.openai import OpenAITextCompletion, OpenAITextCompletionConfig
+from .base import BaseLLM
+from .prompt_templates.factory import custom_prompt, prompt_factory
+
+openai_text_completion_config = OpenAITextCompletionConfig()
 
 
 class AzureOpenAIError(Exception):
@@ -300,9 +304,11 @@ class AzureTextCompletion(BaseLLM):
                         "api_base": api_base,
                     },
                 )
-                return openai_text_completion.convert_to_model_response_object(
-                    response_object=stringified_response,
-                    model_response_object=model_response,
+                return (
+                    openai_text_completion_config.convert_to_chat_model_response_object(
+                        response_object=TextCompletionResponse(**stringified_response),
+                        model_response_object=model_response,
+                    )
                 )
         except AzureOpenAIError as e:
             exception_mapping_worked = True
@@ -373,7 +379,7 @@ class AzureTextCompletion(BaseLLM):
                 },
             )
             response = await azure_client.completions.create(**data, timeout=timeout)
-            return openai_text_completion.convert_to_model_response_object(
+            return openai_text_completion_config.convert_to_chat_model_response_object(
                 response_object=response.model_dump(),
                 model_response_object=model_response,
             )

@@ -1,15 +1,21 @@
-import os, types, traceback
-from enum import Enum
+import io
 import json
-import requests
-import time
-from typing import Callable, Optional, Any
-import litellm
-from litellm.utils import ModelResponse, EmbeddingResponse, get_secret, Usage
+import os
 import sys
+import time
+import traceback
+import types
 from copy import deepcopy
-import httpx
-from .prompt_templates.factory import prompt_factory, custom_prompt
+from enum import Enum
+from typing import Any, Callable, Optional
+
+import httpx  # type: ignore
+import requests  # type: ignore
+
+import litellm
+from litellm.utils import EmbeddingResponse, ModelResponse, Usage, get_secret
+
+from .prompt_templates.factory import custom_prompt, prompt_factory
 
 
 class SagemakerError(Exception):
@@ -23,10 +29,6 @@ class SagemakerError(Exception):
         super().__init__(
             self.message
         )  # Call the base class constructor with the parameters it needs
-
-
-import io
-import json
 
 
 class TokenIterator:
@@ -166,6 +168,7 @@ def completion(
     aws_secret_access_key = optional_params.pop("aws_secret_access_key", None)
     aws_access_key_id = optional_params.pop("aws_access_key_id", None)
     aws_region_name = optional_params.pop("aws_region_name", None)
+    model_id = optional_params.pop("model_id", None)
 
     if aws_access_key_id != None:
         # uses auth params passed to completion
@@ -184,7 +187,8 @@ def completion(
         # I assume majority of users use .env for auth
         region_name = (
             get_secret("AWS_REGION_NAME")
-            or "us-west-2"  # default to us-west-2 if user not specified
+            or aws_region_name  # get region from config file if specified
+            or "us-west-2"  # default to us-west-2 if region not specified
         )
         client = boto3.client(
             service_name="sagemaker-runtime",
@@ -245,15 +249,28 @@ def completion(
                 model=model,
                 logging_obj=logging_obj,
                 data=data,
+                model_id=model_id,
+                aws_secret_access_key=aws_secret_access_key,
+                aws_access_key_id=aws_access_key_id,
+                aws_region_name=aws_region_name,
             )
             return response
-        response = client.invoke_endpoint_with_response_stream(
-            EndpointName=model,
-            ContentType="application/json",
-            Body=data,
-            CustomAttributes="accept_eula=true",
-        )
 
+        if model_id is not None:
+            response = client.invoke_endpoint_with_response_stream(
+                EndpointName=model,
+                InferenceComponentName=model_id,
+                ContentType="application/json",
+                Body=data,
+                CustomAttributes="accept_eula=true",
+            )
+        else:
+            response = client.invoke_endpoint_with_response_stream(
+                EndpointName=model,
+                ContentType="application/json",
+                Body=data,
+                CustomAttributes="accept_eula=true",
+            )
         return response["Body"]
     elif acompletion == True:
         _data = {"inputs": prompt, "parameters": inference_params}
@@ -264,36 +281,68 @@ def completion(
             model=model,
             logging_obj=logging_obj,
             data=_data,
+            model_id=model_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_access_key_id=aws_access_key_id,
+            aws_region_name=aws_region_name,
         )
     data = json.dumps({"inputs": prompt, "parameters": inference_params}).encode(
         "utf-8"
     )
-    ## LOGGING
-    request_str = f"""
-    response = client.invoke_endpoint(
-        EndpointName={model},
-        ContentType="application/json",
-        Body={data},
-        CustomAttributes="accept_eula=true",
-    )
-    """  # type: ignore
-    logging_obj.pre_call(
-        input=prompt,
-        api_key="",
-        additional_args={
-            "complete_input_dict": data,
-            "request_str": request_str,
-            "hf_model_name": hf_model_name,
-        },
-    )
     ## COMPLETION CALL
     try:
-        response = client.invoke_endpoint(
-            EndpointName=model,
-            ContentType="application/json",
-            Body=data,
-            CustomAttributes="accept_eula=true",
-        )
+        if model_id is not None:
+            ## LOGGING
+            request_str = f"""
+            response = client.invoke_endpoint(
+                EndpointName={model},
+                InferenceComponentName={model_id},
+                ContentType="application/json",
+                Body={data}, # type: ignore
+                CustomAttributes="accept_eula=true",
+            )
+            """  # type: ignore
+            logging_obj.pre_call(
+                input=prompt,
+                api_key="",
+                additional_args={
+                    "complete_input_dict": data,
+                    "request_str": request_str,
+                    "hf_model_name": hf_model_name,
+                },
+            )
+            response = client.invoke_endpoint(
+                EndpointName=model,
+                InferenceComponentName=model_id,
+                ContentType="application/json",
+                Body=data,
+                CustomAttributes="accept_eula=true",
+            )
+        else:
+            ## LOGGING
+            request_str = f"""
+            response = client.invoke_endpoint(
+                EndpointName={model},
+                ContentType="application/json",
+                Body={data}, # type: ignore
+                CustomAttributes="accept_eula=true",
+            )
+            """  # type: ignore
+            logging_obj.pre_call(
+                input=prompt,
+                api_key="",
+                additional_args={
+                    "complete_input_dict": data,
+                    "request_str": request_str,
+                    "hf_model_name": hf_model_name,
+                },
+            )
+            response = client.invoke_endpoint(
+                EndpointName=model,
+                ContentType="application/json",
+                Body=data,
+                CustomAttributes="accept_eula=true",
+            )
     except Exception as e:
         status_code = (
             getattr(e, "response", {})
@@ -303,6 +352,8 @@ def completion(
         error_message = (
             getattr(e, "response", {}).get("Error", {}).get("Message", str(e))
         )
+        if "Inference Component Name header is required" in error_message:
+            error_message += "\n pass in via `litellm.completion(..., model_id={InferenceComponentName})`"
         raise SagemakerError(status_code=status_code, message=error_message)
 
     response = response["Body"].read().decode("utf8")
@@ -317,7 +368,10 @@ def completion(
     ## RESPONSE OBJECT
     completion_response = json.loads(response)
     try:
-        completion_response_choices = completion_response[0]
+        if isinstance(completion_response, list):
+            completion_response_choices = completion_response[0]
+        else:
+            completion_response_choices = completion_response
         completion_output = ""
         if "generation" in completion_response_choices:
             completion_output += completion_response_choices["generation"]
@@ -328,7 +382,7 @@ def completion(
         if completion_output.startswith(prompt) and "<s>" in prompt:
             completion_output = completion_output.replace(prompt, "", 1)
 
-        model_response["choices"][0]["message"]["content"] = completion_output
+        model_response.choices[0].message.content = completion_output  # type: ignore
     except:
         raise SagemakerError(
             message=f"LiteLLM Error: Unable to parse sagemaker RAW RESPONSE {json.dumps(completion_response)}",
@@ -341,14 +395,14 @@ def completion(
         encoding.encode(model_response["choices"][0]["message"].get("content", ""))
     )
 
-    model_response["created"] = int(time.time())
-    model_response["model"] = model
+    model_response.created = int(time.time())
+    model_response.model = model
     usage = Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
     )
-    model_response.usage = usage
+    setattr(model_response, "usage", usage)
     return model_response
 
 
@@ -357,8 +411,12 @@ async def async_streaming(
     encoding,
     model_response: ModelResponse,
     model: str,
+    model_id: Optional[str],
     logging_obj: Any,
     data,
+    aws_secret_access_key: Optional[str],
+    aws_access_key_id: Optional[str],
+    aws_region_name: Optional[str],
 ):
     """
     Use aioboto3
@@ -366,11 +424,6 @@ async def async_streaming(
     import aioboto3
 
     session = aioboto3.Session()
-
-    # pop aws_secret_access_key, aws_access_key_id, aws_region_name from kwargs, since completion calls fail with them
-    aws_secret_access_key = optional_params.pop("aws_secret_access_key", None)
-    aws_access_key_id = optional_params.pop("aws_access_key_id", None)
-    aws_region_name = optional_params.pop("aws_region_name", None)
 
     if aws_access_key_id != None:
         # uses auth params passed to completion
@@ -389,7 +442,8 @@ async def async_streaming(
         # I assume majority of users use .env for auth
         region_name = (
             get_secret("AWS_REGION_NAME")
-            or "us-west-2"  # default to us-west-2 if user not specified
+            or aws_region_name  # get region from config file if specified
+            or "us-west-2"  # default to us-west-2 if region not specified
         )
         _client = session.client(
             service_name="sagemaker-runtime",
@@ -398,12 +452,21 @@ async def async_streaming(
 
     async with _client as client:
         try:
-            response = await client.invoke_endpoint_with_response_stream(
-                EndpointName=model,
-                ContentType="application/json",
-                Body=data,
-                CustomAttributes="accept_eula=true",
-            )
+            if model_id is not None:
+                response = await client.invoke_endpoint_with_response_stream(
+                    EndpointName=model,
+                    InferenceComponentName=model_id,
+                    ContentType="application/json",
+                    Body=data,
+                    CustomAttributes="accept_eula=true",
+                )
+            else:
+                response = await client.invoke_endpoint_with_response_stream(
+                    EndpointName=model,
+                    ContentType="application/json",
+                    Body=data,
+                    CustomAttributes="accept_eula=true",
+                )
         except Exception as e:
             raise SagemakerError(status_code=500, message=f"{str(e)}")
         response = response["Body"]
@@ -418,6 +481,10 @@ async def async_completion(
     model: str,
     logging_obj: Any,
     data: dict,
+    model_id: Optional[str],
+    aws_secret_access_key: Optional[str],
+    aws_access_key_id: Optional[str],
+    aws_region_name: Optional[str],
 ):
     """
     Use aioboto3
@@ -425,11 +492,6 @@ async def async_completion(
     import aioboto3
 
     session = aioboto3.Session()
-
-    # pop aws_secret_access_key, aws_access_key_id, aws_region_name from kwargs, since completion calls fail with them
-    aws_secret_access_key = optional_params.pop("aws_secret_access_key", None)
-    aws_access_key_id = optional_params.pop("aws_access_key_id", None)
-    aws_region_name = optional_params.pop("aws_region_name", None)
 
     if aws_access_key_id != None:
         # uses auth params passed to completion
@@ -448,7 +510,8 @@ async def async_completion(
         # I assume majority of users use .env for auth
         region_name = (
             get_secret("AWS_REGION_NAME")
-            or "us-west-2"  # default to us-west-2 if user not specified
+            or aws_region_name  # get region from config file if specified
+            or "us-west-2"  # default to us-west-2 if region not specified
         )
         _client = session.client(
             service_name="sagemaker-runtime",
@@ -456,33 +519,63 @@ async def async_completion(
         )
 
     async with _client as client:
-        ## LOGGING
-        request_str = f"""
-        response = client.invoke_endpoint(
-            EndpointName={model},
-            ContentType="application/json",
-            Body={data},
-            CustomAttributes="accept_eula=true",
-        )
-        """  # type: ignore
-        logging_obj.pre_call(
-            input=data["inputs"],
-            api_key="",
-            additional_args={
-                "complete_input_dict": data,
-                "request_str": request_str,
-            },
-        )
         encoded_data = json.dumps(data).encode("utf-8")
         try:
-            response = await client.invoke_endpoint(
-                EndpointName=model,
-                ContentType="application/json",
-                Body=encoded_data,
-                CustomAttributes="accept_eula=true",
-            )
+            if model_id is not None:
+                ## LOGGING
+                request_str = f"""
+                response = client.invoke_endpoint(
+                    EndpointName={model},
+                    InferenceComponentName={model_id},
+                    ContentType="application/json",
+                    Body={data},
+                    CustomAttributes="accept_eula=true",
+                )
+                """  # type: ignore
+                logging_obj.pre_call(
+                    input=data["inputs"],
+                    api_key="",
+                    additional_args={
+                        "complete_input_dict": data,
+                        "request_str": request_str,
+                    },
+                )
+                response = await client.invoke_endpoint(
+                    EndpointName=model,
+                    InferenceComponentName=model_id,
+                    ContentType="application/json",
+                    Body=encoded_data,
+                    CustomAttributes="accept_eula=true",
+                )
+            else:
+                ## LOGGING
+                request_str = f"""
+                response = client.invoke_endpoint(
+                    EndpointName={model},
+                    ContentType="application/json",
+                    Body={data},
+                    CustomAttributes="accept_eula=true",
+                )
+                """  # type: ignore
+                logging_obj.pre_call(
+                    input=data["inputs"],
+                    api_key="",
+                    additional_args={
+                        "complete_input_dict": data,
+                        "request_str": request_str,
+                    },
+                )
+                response = await client.invoke_endpoint(
+                    EndpointName=model,
+                    ContentType="application/json",
+                    Body=encoded_data,
+                    CustomAttributes="accept_eula=true",
+                )
         except Exception as e:
-            raise SagemakerError(status_code=500, message=f"{str(e)}")
+            error_message = f"{str(e)}"
+            if "Inference Component Name header is required" in error_message:
+                error_message += "\n pass in via `litellm.completion(..., model_id={InferenceComponentName})`"
+            raise SagemakerError(status_code=500, message=error_message)
         response = await response["Body"].read()
         response = response.decode("utf8")
         ## LOGGING
@@ -495,7 +588,10 @@ async def async_completion(
         ## RESPONSE OBJECT
         completion_response = json.loads(response)
         try:
-            completion_response_choices = completion_response[0]
+            if isinstance(completion_response, list):
+                completion_response_choices = completion_response[0]
+            else:
+                completion_response_choices = completion_response
             completion_output = ""
             if "generation" in completion_response_choices:
                 completion_output += completion_response_choices["generation"]
@@ -506,7 +602,7 @@ async def async_completion(
             if completion_output.startswith(data["inputs"]) and "<s>" in data["inputs"]:
                 completion_output = completion_output.replace(data["inputs"], "", 1)
 
-            model_response["choices"][0]["message"]["content"] = completion_output
+            model_response.choices[0].message.content = completion_output  # type: ignore
         except:
             raise SagemakerError(
                 message=f"LiteLLM Error: Unable to parse sagemaker RAW RESPONSE {json.dumps(completion_response)}",
@@ -519,14 +615,14 @@ async def async_completion(
             encoding.encode(model_response["choices"][0]["message"].get("content", ""))
         )
 
-        model_response["created"] = int(time.time())
-        model_response["model"] = model
+        model_response.created = int(time.time())
+        model_response.model = model
         usage = Usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
         )
-        model_response.usage = usage
+        setattr(model_response, "usage", usage)
         return model_response
 
 
@@ -570,7 +666,8 @@ def embedding(
         # I assume majority of users use .env for auth
         region_name = (
             get_secret("AWS_REGION_NAME")
-            or "us-west-2"  # default to us-west-2 if user not specified
+            or aws_region_name  # get region from config file if specified
+            or "us-west-2"  # default to us-west-2 if region not specified
         )
         client = boto3.client(
             service_name="sagemaker-runtime",
@@ -597,7 +694,7 @@ def embedding(
     response = client.invoke_endpoint(
         EndpointName={model},
         ContentType="application/json",
-        Body={data},
+        Body={data}, # type: ignore
         CustomAttributes="accept_eula=true",
     )"""  # type: ignore
     logging_obj.pre_call(
@@ -649,16 +746,20 @@ def embedding(
             {"object": "embedding", "index": idx, "embedding": embedding}
         )
 
-    model_response["object"] = "list"
-    model_response["data"] = output_data
-    model_response["model"] = model
+    model_response.object = "list"
+    model_response.data = output_data
+    model_response.model = model
 
     input_tokens = 0
     for text in input:
         input_tokens += len(encoding.encode(text))
 
-    model_response["usage"] = Usage(
-        prompt_tokens=input_tokens, completion_tokens=0, total_tokens=input_tokens
+    setattr(
+        model_response,
+        "usage",
+        Usage(
+            prompt_tokens=input_tokens, completion_tokens=0, total_tokens=input_tokens
+        ),
     )
 
     return model_response
