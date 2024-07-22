@@ -474,6 +474,8 @@ def construct_tool_use_system_prompt(
         "</invoke>\n"
         "</function_calls>\n"
         "\n"
+        "Be sure to properly escape content within strings. Writing multi-line strings and nested strings inside JSON can be tricky, so pay extra attention when writing the JSON to make sure it is syntactically correct.\n"
+        "\n"
         "Here are the tools available:\n"
         "<tools>\n" + "\n".join([tool_str for tool_str in tool_str_list]) + "\n</tools>"
     )
